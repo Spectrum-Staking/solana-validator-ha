@@ -29,7 +29,7 @@ func newStubRPC(t *testing.T, results map[string]any) *stubRPC {
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Method string `json:"method"`
-			ID     int    `json:"id"`
+			ID     any    `json:"id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)

@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
-	"github.com/gagliardetto/solana-go"
 	"github.com/sol-strategies/solana-validator-ha/internal/config"
 	"github.com/sol-strategies/solana-validator-ha/internal/logging"
 	"github.com/sol-strategies/solana-validator-ha/internal/rpc"
+	"github.com/solana-foundation/solana-go/v2"
 )
 
 // alpenglowFeature is the feature gate that schedules the Alpenglow migration.

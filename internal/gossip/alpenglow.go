@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	solana "github.com/gagliardetto/solana-go"
-	solanagorpc "github.com/gagliardetto/solana-go/rpc"
 	"github.com/sol-strategies/solana-validator-ha/internal/consensus"
+	solana "github.com/solana-foundation/solana-go/v2"
+	solanagorpc "github.com/solana-foundation/solana-go/v2/rpc"
 )
 
 // Reasons a sample found no active peer.

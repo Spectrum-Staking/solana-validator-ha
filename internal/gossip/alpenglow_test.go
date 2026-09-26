@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	solanagorpc "github.com/gagliardetto/solana-go/rpc"
 	"github.com/sol-strategies/solana-validator-ha/internal/config"
 	"github.com/sol-strategies/solana-validator-ha/internal/consensus"
 	"github.com/sol-strategies/solana-validator-ha/internal/rpc"
+	solanagorpc "github.com/solana-foundation/solana-go/v2/rpc"
 )
 
 const (
@@ -246,7 +246,7 @@ func TestRefresh_AlpenglowFinalizationLagVetoes(t *testing.T) {
 		var req struct {
 			Method string           `json:"method"`
 			Params []map[string]any `json:"params"`
-			ID     int              `json:"id"`
+			ID     any              `json:"id"`
 		}
 		json.NewDecoder(r.Body).Decode(&req) //nolint:errcheck
 		results := map[string]interface{}{
