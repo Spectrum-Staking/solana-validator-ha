@@ -116,6 +116,8 @@ func (c *Config) LoadFromFile(filePath string) error {
 	// Set bool defaults that cannot be expressed as Go zero values.
 	// k.Set must be called before k.Load so the file can override them.
 	k.Set("update.check_enabled", true) //nolint:errcheck
+	// 0 disables the network stake check, so its non-zero default must be set the same way.
+	k.Set("failover.alpenglow.network_current_stake_ratio_min", defaultNetworkCurrentStakeRatioMin) //nolint:errcheck
 
 	// Load YAML config file
 	if err := k.Load(file.Provider(c.File), yaml.Parser()); err != nil {
@@ -187,6 +189,16 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	err = c.Cluster.Consensus.Validate()
+	if err != nil {
+		return err
+	}
+
+	err = c.Failover.Alpenglow.Validate(c.Failover.PollIntervalDuration)
+	if err != nil {
+		return err
+	}
+
 	// cluster.rpc_urls may contain the local validator RPC URL, but only when HA peers
 	// are configured as mutual --entrypoint flags (enabling direct CRDS gossip exchange).
 	// Without mutual --entrypoints, local gossip data for peers may be stale. It is safe
@@ -251,6 +263,8 @@ func (c *Config) validate() error {
 		)
 	}
 
+	c.warnAboutTowerOnlySettings()
+
 	// failover.recording: validate output dir is reachable and writable at startup
 	if c.Failover.Recording.Enabled {
 		resolvedDir := c.Failover.Recording.ResolvedOutputDir(c.File)
@@ -261,6 +275,18 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// warnAboutTowerOnlySettings warns about failover settings that only take effect while the
+// cluster runs TowerBFT, because Alpenglow votes are judged by vote lag instead of delinquency.
+func (c *Config) warnAboutTowerOnlySettings() {
+	mode := c.Cluster.Consensus.Mode
+	if mode == ConsensusModeAlpenglow && c.Failover.DelinquencyBypass {
+		c.logger.Warn("failover.delinquency_bypass is ignored because cluster.consensus.mode is alpenglow")
+	}
+	if mode != ConsensusModeTower && c.Failover.DelinquentSlotDistanceOverride.Enabled {
+		c.logger.Warnf("failover.delinquent_slot_distance_override only applies while the cluster runs TowerBFT (cluster.consensus.mode is %s)", mode)
+	}
 }
 
 // setDefaults sets default values for configuration
