@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/sol-strategies/solana-validator-ha/internal/cache"
 	"github.com/sol-strategies/solana-validator-ha/internal/config"
+	"github.com/sol-strategies/solana-validator-ha/internal/consensus"
 	"github.com/sol-strategies/solana-validator-ha/internal/constants"
 	"github.com/sol-strategies/solana-validator-ha/internal/gossip"
 	"github.com/sol-strategies/solana-validator-ha/internal/local"
@@ -48,6 +49,18 @@ type Manager struct {
 	// recordingOutputDir is the resolved output directory for failover recordings (empty if disabled).
 	recordingOutputDir string
 	activeRecorder     *recording.Recorder
+	// detector tracks the cluster's consensus phase (TowerBFT or Alpenglow).
+	detector *consensus.Detector
+	// lastLeaderlessReason is from the previous sample, so a recording gets one vote-lag event
+	// per streak rather than one per sample.
+	lastLeaderlessReason string
+	warnedBypassIgnored  bool
+}
+
+// vetoOutcomes maps a gossip veto reason to the recording outcome of the failover it aborts.
+var vetoOutcomes = map[string]string{
+	gossip.VetoClusterStalled:      "aborted_cluster_stalled",
+	gossip.VetoVoteAccountExcluded: "aborted_vote_account_excluded",
 }
 
 // NewManager creates a new HA manager from options
@@ -156,17 +169,33 @@ func (m *Manager) initialize() error {
 		"health_check_port", m.cfg.Prometheus.HealthCheckPort,
 	)
 
+	// the gossip state and the consensus detector both run on the HA monitor goroutine, so they
+	// can share one cluster RPC client and its URL rotation
+	clusterRPC := rpc.NewClient(m.logPrefix, m.cfg.Cluster.RPCURLs...).
+		WithTimeout(m.cfg.Cluster.RPCTimeoutDuration).
+		WithCooldown(m.cfg.Cluster.RPCURLCooldownDuration)
+
 	// create gossip state
 	m.logger.Debug("creating gossip state")
 	m.gossipState = gossip.NewState(gossip.Options{
-		ClusterRPC: rpc.NewClient(m.logPrefix, m.cfg.Cluster.RPCURLs...).
-			WithTimeout(m.cfg.Cluster.RPCTimeoutDuration).
-			WithCooldown(m.cfg.Cluster.RPCURLCooldownDuration),
+		ClusterRPC:                     clusterRPC,
 		ActivePubkey:                   m.cfg.Validator.Identities.ActivePubkey(),
 		ConfigPeers:                    m.cfg.Failover.Peers,
 		DelinquentSlotDistanceOverride: m.cfg.Failover.DelinquentSlotDistanceOverride,
 		SelfIP:                         m.peerSelf.IP,
 		LogPrefix:                      m.logPrefix,
+		Alpenglow:                      m.cfg.Failover.Alpenglow,
+	})
+
+	// create consensus detector; it gets its own local RPC client because the local state's
+	// client is used by the health tracker goroutine
+	m.logger.Debug("creating consensus detector", "mode", m.cfg.Cluster.Consensus.Mode)
+	m.detector = consensus.NewDetector(consensus.Options{
+		Mode:              m.cfg.Cluster.Consensus.Mode,
+		DetectionInterval: m.cfg.Cluster.Consensus.DetectionIntervalDuration,
+		ClusterRPC:        clusterRPC,
+		LocalRPC:          rpc.NewClient(m.logPrefix, m.cfg.Validator.RPCURL),
+		LogPrefix:         m.logPrefix,
 	})
 
 	// create local state
@@ -255,7 +284,8 @@ func (m *Manager) haMonitorLoop() error {
 		m.logger.Info("monitoring HA state", "poll_interval", m.cfg.Failover.PollIntervalDuration)
 	}
 
-	// initial gossip state population
+	// initial consensus phase and gossip state population
+	m.refreshConsensus()
 	m.gossipState.Refresh()
 
 	// start the monitor loop with ticker aligned to interval boundaries
@@ -365,7 +395,8 @@ func (m *Manager) buildGossipSample() recording.GossipSample {
 	}
 
 	localSnapshot := m.cache.GetState()
-	return recording.GossipSample{
+	view := m.detector.View()
+	sample := recording.GossipSample{
 		SampledAt:              m.gossipState.PeerStatesRefreshedAt,
 		Peers:                  peers,
 		LeaderlessSamplesCount: m.gossipState.LeaderlessSamplesCount,
@@ -376,7 +407,21 @@ func (m *Manager) buildGossipSample() recording.GossipSample {
 		LocalHealthy:           localSnapshot.Status == constants.StatusHealthy,
 		SelfInGossip:           m.isSelfInGossip(),
 		GossipPubkey:           m.selfGossipPubkey(),
+		ConsensusPhase:         view.Phase.String(),
+		AlpenglowGenesisSlot:   view.GenesisSlot,
+		LeaderlessReason:       m.gossipState.LeaderlessReason(),
+		Veto:                   m.gossipState.VetoReason(),
 	}
+	if signals, ok := m.gossipState.AlpenglowSignals(); ok {
+		localGenesisMatch, _ := m.detector.LocalEligibility()
+		sample.LocalGenesisMatch = &localGenesisMatch
+		sample.FinalizedSlot = signals.FinalizedSlot
+		sample.ClusterLive = &signals.ClusterLive
+		if signals.NetworkStakeRatioKnown {
+			sample.NetworkStakeRatio = &signals.NetworkStakeRatio
+		}
+	}
+	return sample
 }
 
 // newRecorder creates a Recorder seeded with node/config context and the current ring snapshot.
@@ -394,6 +439,11 @@ func (m *Manager) newRecorder(detectedAt time.Time) *recording.Recorder {
 		LeaderlessSamplesThreshold:         m.cfg.Failover.LeaderlessSamplesThreshold,
 		LeaderlessConfirmationPollDuration: m.cfg.Failover.LeaderlessConfirmationPollDuration.String(),
 		DelinquencyBypass:                  m.cfg.Failover.DelinquencyBypass,
+		ConsensusMode:                      string(m.cfg.Cluster.Consensus.Mode),
+		VoteLagSlotsThreshold:              m.cfg.Failover.Alpenglow.VoteLagSlotsThreshold,
+		WarmupSlots:                        m.cfg.Failover.Alpenglow.WarmupSlots,
+		FinalizationStallDuration:          m.cfg.Failover.Alpenglow.FinalizationStallDuration.String(),
+		NetworkCurrentStakeRatioMin:        m.cfg.Failover.Alpenglow.NetworkCurrentStakeRatioMin,
 	}
 	if m.cfg.Failover.DelinquentSlotDistanceOverride.Enabled {
 		v := m.cfg.Failover.DelinquentSlotDistanceOverride.Value
@@ -458,7 +508,12 @@ func (m *Manager) observeRecording(sample recording.GossipSample, undeclaredActi
 	}
 	if m.activeRecorder != nil {
 		m.activeRecorder.AddSample(sample)
-		m.activeRecorder.AddEvent("network_recovered", "")
+		// a vetoed sample counts the active as present, which also ends the incident
+		detail := ""
+		if sample.Veto != "" {
+			detail = "veto=" + sample.Veto
+		}
+		m.activeRecorder.AddEvent("network_recovered", detail)
 		m.finishRecording("recovered_no_failover", "unknown", "unknown")
 	}
 	return false
@@ -468,7 +523,8 @@ func (m *Manager) observeRecording(sample recording.GossipSample, undeclaredActi
 func (m *Manager) ensureHAState() {
 	m.logger.Debug("ensuring HA")
 
-	// refresh gossip state
+	// refresh consensus phase, then gossip state judged by that phase's rules
+	m.refreshConsensus()
 	m.gossipState.Refresh()
 
 	// refresh metrics
@@ -479,6 +535,7 @@ func (m *Manager) ensureHAState() {
 	m.ring.Add(sample)
 	undeclaredActive := m.gossipState.HasConfigUndeclaredActivePeer()
 	m.observeRecording(sample, undeclaredActive)
+	m.observeAlpenglowEvidence(sample)
 
 	// do nothing except warn if a config-undeclared active peer is found, this prevents false positive failovers
 	// and prompts users to declare these so that the anti-race condition logic (based on IPs) can continue to work as intended
@@ -502,7 +559,7 @@ func (m *Manager) ensureHAState() {
 		// ⚠️ Risk: a validator on a minority fork can appear delinquent but later recover. If it does,
 		// this bypass may trigger an unnecessary failover. Only enable if your validator can enter a
 		// "ghost" state (alive in gossip, not voting) that it cannot recover from on its own.
-		if m.cfg.Failover.DelinquencyBypass && m.gossipState.ActivePeerIsDelinquent() {
+		if m.cfg.Failover.DelinquencyBypass && m.gossipState.ActivePeerIsDelinquent() && m.delinquencyBypassAllowed() {
 			m.logger.Error("active peer declared delinquent by network - bypassing leaderless sample threshold and triggering failover (delinquency_bypass enabled)")
 			if m.activeRecorder != nil {
 				detail := fmt.Sprintf("leaderless_count=%d threshold=%d",
@@ -599,6 +656,25 @@ func (m *Manager) ensureHAState() {
 		return
 	}
 
+	// under Alpenglow we must be on the same Alpenglow genesis as the cluster, otherwise our
+	// votes cannot count; getHealth alone does not show this
+	if eligible, reason := m.detector.LocalEligibility(); !eligible {
+		m.logger.Error("we have not migrated to the cluster's Alpenglow genesis - unable to become active in failover",
+			"reason", reason,
+			"cluster_genesis_slot", m.detector.View().GenesisSlot,
+		)
+		m.metrics.IncFailoverVeto(reason)
+		if m.activeRecorder != nil {
+			m.activeRecorder.AddEvent("veto_local_genesis", "reason="+reason)
+		}
+		m.finishRecording("aborted_local_not_migrated", fromNode, "unknown")
+		return
+	}
+
+	// remember whether the leaderless streak rested on voting evidence alone: the post-delay
+	// refresh resets the streak if the active is then vetoed rather than judged not voting
+	voteOnlyStreak := m.gossipState.LeaderlessStreakIsVoteOnly()
+
 	// at this point we know we are in gossip, healthy, and passive
 	// so we begin checks to make sure none of our peers have already taken over as active
 
@@ -643,6 +719,22 @@ func (m *Manager) ensureHAState() {
 		return
 	}
 
+	// A streak built on voting evidence alone is abandoned if the re-validation shows a failover
+	// cannot help: the whole cluster stalled, or the active's vote account cannot vote at all.
+	// A streak with the active missing from gossip is never vetoed; a dead host is dead during a
+	// stall too.
+	if delayApplied && voteOnlyStreak {
+		if veto := m.gossipState.VetoReason(); veto != "" {
+			m.logger.Warn("active peer's missing votes are no longer held against it after the takeover delay - aborting takeover", "veto", veto)
+			m.metrics.IncFailoverVeto(veto)
+			if m.activeRecorder != nil {
+				m.activeRecorder.AddEvent("veto_"+veto, "stage=post_delay")
+			}
+			m.finishRecording(vetoOutcomes[veto], fromNode, "unknown")
+			return
+		}
+	}
+
 	// If we delayed (rank > 0) and the post-delay re-validation refresh found an active peer
 	// (LeaderlessSamplesCount reset to 0), a peer took over during our delay window — abort.
 	// We do NOT check this for rank-0 nodes (delayApplied == false): no time elapsed, no
@@ -683,6 +775,51 @@ func (m *Manager) ensureHAState() {
 			m.finishRecording("promotion_failed", fromNode, m.cfg.Validator.Name)
 		}
 	}
+}
+
+// refreshConsensus updates the consensus phase and hands it to the gossip state, so the next
+// gossip Refresh judges voting evidence by the rules of that phase.
+func (m *Manager) refreshConsensus() {
+	previous := m.detector.Phase()
+	m.detector.Refresh(m.ctx)
+	view := m.detector.View()
+	m.gossipState.SetConsensusView(view)
+	if view.Phase != previous && m.activeRecorder != nil {
+		m.activeRecorder.AddEvent("consensus_phase_changed", fmt.Sprintf("from=%s to=%s genesis_slot=%d", previous, view.Phase, view.GenesisSlot))
+		m.checkpointRecording()
+	}
+}
+
+// observeAlpenglowEvidence counts vetoed samples, and adds a timeline event to the open recording
+// when the active's vote lag first exceeds the threshold. A vetoed sample closes the recording
+// itself, see observeRecording.
+func (m *Manager) observeAlpenglowEvidence(sample recording.GossipSample) {
+	if sample.Veto != "" {
+		m.metrics.IncFailoverVeto(sample.Veto)
+	}
+	if m.activeRecorder != nil && sample.LeaderlessReason == gossip.LeaderlessReasonVoteLag && m.lastLeaderlessReason != gossip.LeaderlessReasonVoteLag {
+		detail := fmt.Sprintf("threshold=%d", m.cfg.Failover.Alpenglow.VoteLagSlotsThreshold)
+		if lag, ok := m.gossipState.ActiveVoteLag(); ok {
+			detail = fmt.Sprintf("vote_lag_slots=%d %s", lag, detail)
+		}
+		m.activeRecorder.AddEvent("alpenglow_vote_lag_exceeded", detail)
+		m.checkpointRecording()
+	}
+	m.lastLeaderlessReason = sample.LeaderlessReason
+}
+
+// delinquencyBypassAllowed reports whether failover.delinquency_bypass may skip the leaderless
+// threshold. It only applies under TowerBFT: in the other phases the sample-by-sample vote
+// evidence is either not trusted or already covers delinquency.
+func (m *Manager) delinquencyBypassAllowed() bool {
+	if m.detector.Phase() == consensus.PhaseTower {
+		return true
+	}
+	if !m.warnedBypassIgnored {
+		m.logger.Warn("failover.delinquency_bypass is ignored outside the TowerBFT phase", "phase", m.detector.Phase())
+		m.warnedBypassIgnored = true
+	}
+	return false
 }
 
 // ensurePassive calls a user-specified command that should be idempotent in setting the passive role
@@ -955,15 +1092,31 @@ func (m *Manager) refreshMetrics() {
 	selfInGossip := m.gossipState.HasIP(m.peerSelf.IP)
 
 	// Update cache with current state
+	view := m.detector.View()
 	state := cache.State{
-		ValidatorName:  m.cfg.Validator.Name,
-		PublicIP:       m.peerSelf.IP,
-		Role:           role,
-		RuntimePubkey:  runtimePubkey,
-		Status:         status,
-		PeerCount:      peerCount,
-		SelfInGossip:   selfInGossip,
-		FailoverStatus: constants.StatusIdle,
+		ValidatorName:        m.cfg.Validator.Name,
+		PublicIP:             m.peerSelf.IP,
+		Role:                 role,
+		RuntimePubkey:        runtimePubkey,
+		Status:               status,
+		PeerCount:            peerCount,
+		SelfInGossip:         selfInGossip,
+		FailoverStatus:       constants.StatusIdle,
+		ConsensusPhase:       view.Phase.String(),
+		AlpenglowGenesisSlot: view.GenesisSlot,
+	}
+	if lag, ok := m.gossipState.ActiveVoteLag(); ok {
+		state.ActiveVoteLagSlots = &lag
+	}
+	if signals, ok := m.gossipState.AlpenglowSignals(); ok {
+		localGenesisMatch, _ := m.detector.LocalEligibility()
+		state.Alpenglow = &cache.AlpenglowState{
+			LocalGenesisMatch:      localGenesisMatch,
+			FinalizedSlot:          signals.FinalizedSlot,
+			ClusterLive:            signals.ClusterLive,
+			NetworkStakeRatio:      signals.NetworkStakeRatio,
+			NetworkStakeRatioKnown: signals.NetworkStakeRatioKnown,
+		}
 	}
 
 	m.cache.UpdateState(state)
